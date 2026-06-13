@@ -1,0 +1,21 @@
+# core data
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
+requests>=2.28
+
+# football data sources
+kagglehub>=0.3
+statsbombpy>=1.1
+soccerdata>=0.5
+understat>=0.1.4
+
+# ML / stats
+scikit-learn>=1.3
+
+# viz (optional, used in exploration.ipynb)
+matplotlib>=3.7
+seaborn>=0.12
+
+# jupyter (optional)
+ipykernel
