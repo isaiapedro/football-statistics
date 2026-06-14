@@ -451,66 +451,30 @@ _UNDERSTAT_LEAGUES = {
 _CLUB_SEASONS = [2022, 2023, 2024, 2025]
 
 
-def load_fbref_club_stats(
-    leagues=None,
-    seasons=None,
-    stat_type="standard",
-    cache_path=None,
-):
+# FBref club scraping via soccerdata is blocked by Cloudflare on headless Chrome.
+# Replaced by Understat-based functions (no browser required).
+# Manual workaround: download CSV from fbref.com directly in a browser and pass
+# as cache_path — load_fbref_club_stats() will read it without scraping.
+
+def load_fbref_club_stats(cache_path=None, **_kwargs):
     """
-    Player season stats from FBref for club leagues via soccerdata.
+    FBref club scraping blocked (Cloudflare). Two options:
+      1. Pass cache_path pointing to a CSV you manually downloaded from fbref.com
+      2. Use load_understat_team_stats() for automated xG/goals data
 
-    leagues: list of FBref league codes. Default: Top 5 combined.
-      Use "Big 5 European Leagues Combined" for one-shot fetch of all 5.
-    seasons: list of start-years. Default: [2022, 2023, 2024, 2025] (4 seasons).
-    stat_type: "standard" | "shooting" | "passing" | "goal_shot_creation" | "defense" | "misc"
-      - "standard"   → goals, assists, xg, xag, prgc (progressive carries), prgp, prgr
-      - "shooting"   → shots, sot, xg, npxg, dist
-      - "passing"    → cmp, att, cmp%, prgp, final_third, key_passes
-      - "defense"    → tkl, int, blocks, clr, err
-    cache_path: saves/loads result as CSV.
-
-    Usage:
-        # All Top 5 leagues, last 4 seasons — standard stats
-        df = load_fbref_club_stats(cache_path="data/fbref_club_standard.csv")
-
-        # Shooting stats only (xG + npxG)
-        sh = load_fbref_club_stats(stat_type="shooting", cache_path="data/fbref_club_shooting.csv")
-
-        # Find Mbappé's last 4 seasons
-        df[df["player"].str.contains("Mbapp")]
+    Manual download steps:
+      fbref.com → Big 5 Stats → Squad Standard Stats → Share & Export → CSV
+      Save as data/fbref_club_standard.csv, then call:
+        load_fbref_club_stats(cache_path='data/fbref_club_standard.csv')
     """
-    import soccerdata as sd
-
     if cache_path and Path(cache_path).exists():
         return pd.read_csv(cache_path)
-
-    if leagues is None:
-        leagues = ["Big 5 European Leagues Combined"]
-    if seasons is None:
-        seasons = _CLUB_SEASONS
-
-    frames = []
-    for season in seasons:
-        try:
-            fb = sd.FBref(leagues=leagues, seasons=[season])
-            df = fb.read_player_season_stats(stat_type=stat_type)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = ["_".join(filter(None, c)).strip("_") for c in df.columns]
-            df = df.reset_index()
-            df["season_start"] = season
-            frames.append(df)
-        except Exception as exc:
-            print(f"FBref club {season} failed: {exc}")
-            continue
-
-    if not frames:
-        return pd.DataFrame()
-
-    result = pd.concat(frames, ignore_index=True)
-    if cache_path:
-        result.to_csv(cache_path, index=False)
-    return result
+    print(
+        "FBref blocked (Cloudflare). Options:\n"
+        "  1. Manual: download from fbref.com → save CSV → pass cache_path\n"
+        "  2. Automated: use load_understat_team_stats() for xG data"
+    )
+    return pd.DataFrame()
 
 
 def load_understat_player_xg(player_name, seasons=None):
@@ -564,46 +528,108 @@ def load_understat_player_xg(player_name, seasons=None):
         return loop.run_until_complete(_fetch())
 
 
+def load_understat_team_stats(league=None, seasons=None, cache_path=None):
+    """
+    Team-level xG/goals from Understat for Top 5 leagues.
+    Automated alternative to load_fbref_club_stats() (which is Cloudflare-blocked).
+
+    league: Understat league key. None = all leagues in _UNDERSTAT_LEAGUES.
+    seasons: list of year strings e.g. ["2022","2023","2024","2025"]. Default: last 4.
+    cache_path: save/load as CSV.
+
+    Returns DataFrame: league, season, team, scored, missed, xG, xGA, wins, draws, loses, pts.
+
+    Usage:
+        df = load_understat_team_stats()
+        df[df["team"] == "Manchester City"]
+        df.groupby(["team","season"])[["xG","xGA"]].mean()
+    """
+    import asyncio
+    from understat import Understat
+
+    if cache_path and Path(cache_path).exists():
+        return pd.read_csv(cache_path)
+
+    if seasons is None:
+        seasons = ["2022", "2023", "2024", "2025"]
+
+    leagues_to_fetch = {league: _UNDERSTAT_LEAGUES[league]} if league else _UNDERSTAT_LEAGUES
+
+    async def _fetch():
+        frames = []
+        async with Understat() as u:
+            for league_key, ustat_name in leagues_to_fetch.items():
+                for season in seasons:
+                    try:
+                        teams = await u.get_league_table(ustat_name, int(season))
+                        df = pd.DataFrame(teams)
+                        df["league"] = league_key
+                        df["season"] = season
+                        frames.append(df)
+                    except Exception as exc:
+                        print(f"Understat {league_key} {season}: {exc}")
+                        continue
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    try:
+        result = asyncio.run(_fetch())
+    except RuntimeError:
+        import nest_asyncio
+        nest_asyncio.apply()
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(_fetch())
+
+    if not result.empty and cache_path:
+        result.to_csv(cache_path, index=False)
+    return result
+
+
 def player_club_profile(player_name, fbref_df=None, cache_path=None):
     """
     Club stats for a player across last 4 seasons.
-    Filters load_fbref_club_stats() by player name (partial match).
+    Primary: Understat xG (automated). Fallback: FBref CSV (manual download).
 
-    fbref_df: pre-loaded club stats DataFrame. If None, loads from cache_path or fetches.
+    fbref_df: pre-loaded FBref DataFrame. If None + cache_path exists, loads from CSV.
+    If neither available, falls back to Understat only.
 
-    Returns dict with:
-      - club_seasons: DataFrame (season, team, goals, assists, xg, ...)
-      - understat_xg: season xG from Understat (if reachable)
-      - summary: aggregated totals
+    Returns dict:
+      - player: name
+      - understat_xg: DataFrame (season, goals, shots, xG, xA, ...)
+      - club_seasons: DataFrame from FBref if available, else empty
+      - summary: understat aggregated totals
 
     Usage:
         profile = player_club_profile("Kylian Mbappé")
-        profile = player_club_profile("Vinicius", fbref_df=pre_loaded_df)
+        profile["understat_xg"]   # season xG (always available)
+        profile["club_seasons"]   # FBref data (only if cache_path CSV exists)
     """
-    if fbref_df is None:
-        fbref_df = load_fbref_club_stats(cache_path=cache_path or str(DATA / "fbref_club_standard.csv"))
+    # Always try Understat (automated, no scraping)
+    try:
+        ust_df = load_understat_player_xg(player_name)
+    except Exception as exc:
+        print(f"Understat lookup failed for '{player_name}': {exc}")
+        ust_df = pd.DataFrame()
 
-    if fbref_df.empty:
-        return {"player": player_name, "club_seasons": pd.DataFrame(), "error": "FBref data unavailable"}
+    # FBref: only if manual cache CSV present
+    club_df = pd.DataFrame()
+    if fbref_df is None and cache_path and Path(cache_path).exists():
+        fbref_df = pd.read_csv(cache_path)
 
-    # Find player column — FBref multi-index flattening may rename it
-    player_col = next((c for c in fbref_df.columns if "player" in c.lower()), None)
-    if player_col is None:
-        return {"player": player_name, "club_seasons": pd.DataFrame(), "error": "player column not found"}
+    if fbref_df is not None and not fbref_df.empty:
+        player_col = next((c for c in fbref_df.columns if "player" in c.lower()), None)
+        if player_col:
+            mask = fbref_df[player_col].fillna("").str.lower().str.contains(player_name.lower())
+            club_df = fbref_df[mask].copy()
 
-    mask = fbref_df[player_col].fillna("").str.lower().str.contains(player_name.lower())
-    club_df = fbref_df[mask].copy()
-
-    if club_df.empty:
-        return {"player": player_name, "club_seasons": pd.DataFrame(),
-                "error": f"'{player_name}' not found in FBref club data"}
-
-    # Build summary over numeric cols
-    num_cols = club_df.select_dtypes(include=[np.number]).columns.tolist()
-    summary = club_df[num_cols].sum().round(3).to_dict() if num_cols else {}
+    # Summary from Understat
+    summary: dict = {}
+    if not ust_df.empty:
+        num_cols = ust_df.select_dtypes(include=[np.number]).columns.tolist()
+        summary = ust_df[num_cols].sum().round(3).to_dict() if num_cols else {}
 
     return {
         "player": player_name,
+        "understat_xg": ust_df,
         "club_seasons": club_df,
         "summary": summary,
     }
@@ -2062,67 +2088,26 @@ def player_statsbomb_stats(sb_matches=None, season_ids=None, cache_path=None):
 
 # ── FBRef player stats via soccerdata ────────────────────────────────────────
 
-def load_fbref_player_stats(
-    competitions=None,
-    seasons=None,
-    stat_type="standard",
-    cache_path=None,
-):
+def load_fbref_player_stats(cache_path=None, **_kwargs):
     """
-    Player season stats from FBRef via soccerdata.
+    FBref player stats (international tournaments) — Cloudflare-blocked.
 
-    competitions: FBRef league codes. Default: WC + Euro (covers most active intl players).
-      Full list: ["INT-World Cup", "INT-European Championship"]
-      Other options: "INT-Women's World Cup", etc.
-    seasons: list of years e.g. [2022, 2024]. Default: [2018, 2022, 2024].
-    stat_type: "standard" | "shooting" | "passing" | "goal_shot_creation" | "defense" | "misc"
-    cache_path: saves/loads result as CSV.
+    Manual workaround:
+      fbref.com → World Cup → Player Standard Stats → Share & Export → CSV
+      Save as data/fbref_player_stats.csv, then:
+        load_fbref_player_stats(cache_path='data/fbref_player_stats.csv')
 
-    Returns DataFrame with player, team, season, and per-stat columns.
-    Columns vary by stat_type — "standard" gives: goals, assists, shots, xg, xag, prgc, prgp, prgr.
-
-    Usage:
-        # All WC 2022 player standard stats
-        df = load_fbref_player_stats(competitions=["INT-World Cup"], seasons=[2022])
-
-        # Recent Euro + WC for active players
-        df = load_fbref_player_stats(seasons=[2021, 2022, 2024])
-        df[df["player"] == "Kylian Mbappé"]
+    For WC player xG use load_statsbomb_player_stats() (fully automated).
+    For club xG use load_understat_player_xg(player_name).
     """
-    import soccerdata as sd
-
     if cache_path and Path(cache_path).exists():
         return pd.read_csv(cache_path)
-
-    if competitions is None:
-        competitions = ["INT-World Cup", "INT-European Championship"]
-    if seasons is None:
-        seasons = [2018, 2022, 2024]
-
-    frames = []
-    for comp in competitions:
-        for season in seasons:
-            try:
-                fb = sd.FBref(leagues=[comp], seasons=[season])
-                df = fb.read_player_season_stats(stat_type=stat_type)
-                # Flatten multi-index columns if present
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = ["_".join(filter(None, c)).strip("_") for c in df.columns]
-                df = df.reset_index()
-                df["competition"] = comp
-                df["season"] = season
-                frames.append(df)
-            except Exception as exc:
-                print(f"FBref {comp} {season} failed: {exc}")
-                continue
-
-    if not frames:
-        return pd.DataFrame()
-
-    result = pd.concat(frames, ignore_index=True)
-    if cache_path:
-        result.to_csv(cache_path, index=False)
-    return result
+    print(
+        "FBref blocked (Cloudflare). Manual download required.\n"
+        "  fbref.com → World Cup → Player Stats → Export CSV → save as data/fbref_player_stats.csv\n"
+        "  Alternative: use load_statsbomb_player_stats() for WC xG data."
+    )
+    return pd.DataFrame()
 
 
 def active_players_recent(goals_df=None, since_year=2022):
@@ -2481,28 +2466,31 @@ def main():
         print(f"  Possession:    {stats['home_poss']}% | {stats['away_poss']}%")
 
     if args.club_stats or args.club_shooting:
-        st = "shooting" if args.club_shooting else "standard"
-        cache = str(DATA / f"fbref_club_{st}.csv")
-        print(f"Fetching FBref club {st} stats (Top 5, 2022–2025)...")
-        cdf = load_fbref_club_stats(stat_type=st, cache_path=cache)
-        if args.team:
-            team_col = next((c for c in cdf.columns if "team" in c.lower() or "squad" in c.lower()), None)
-            if team_col:
-                cdf = cdf[cdf[team_col].fillna("").str.lower().str.contains(args.team.lower())]
-        print(cdf.head(args.top).to_string(index=False))
+        cache = str(DATA / "understat_team_stats.csv")
+        print("Fetching Understat team xG/goals (Top 5 leagues, 2022–2025)...")
+        cdf = load_understat_team_stats(cache_path=cache)
+        if not cdf.empty:
+            if args.team:
+                team_col = next((c for c in cdf.columns if "team" in c.lower()), None)
+                if team_col:
+                    cdf = cdf[cdf[team_col].fillna("").str.lower().str.contains(args.team.lower())]
+            print(cdf.head(args.top).to_string(index=False))
 
     if args.player_profile:
-        cache = str(DATA / "fbref_club_standard.csv")
+        fbref_cache = str(DATA / "fbref_club_standard.csv")
         print(f"Building club profile for '{args.player_profile}'...")
-        profile = player_club_profile(args.player_profile, cache_path=cache)
-        if "error" in profile:
-            print(f"Error: {profile['error']}")
+        profile = player_club_profile(args.player_profile, cache_path=fbref_cache)
+        print(f"\n=== {profile['player']} — Understat xG ===\n")
+        if not profile["understat_xg"].empty:
+            print(profile["understat_xg"].to_string(index=False))
         else:
-            print(f"\n=== {profile['player']} — Club Stats ===\n")
+            print("  No Understat data found.")
+        if not profile["club_seasons"].empty:
+            print(f"\n=== FBref Club Seasons ===\n")
             print(profile["club_seasons"].to_string(index=False))
-            print("\n--- Totals ---")
-            for k, v in profile.get("summary", {}).items():
-                print(f"  {k}: {v}")
+        print("\n--- Totals ---")
+        for k, v in profile.get("summary", {}).items():
+            print(f"  {k}: {v}")
 
     if args.recent_intl:
         recent = load_recent_internationals(intl, years=4)
