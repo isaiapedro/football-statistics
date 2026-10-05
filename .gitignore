@@ -10,6 +10,13 @@ __pycache__/
 *.pyd
 .Python
 
+# claude
+.claude/
+
+# requirements
+
+requirements.txt
+
 # jupyter outputs (keep .ipynb but strip outputs via nbstripout or just ignore)
 .ipynb_checkpoints/
 
